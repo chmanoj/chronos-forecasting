@@ -5,9 +5,14 @@ from .base import BaseChronosPipeline, ForecastType
 from .chronos import (
     ChronosConfig,
     ChronosModel,
+    ChronosMoEModel,
     ChronosPipeline,
+    ChronosMoEPipeline,
     ChronosTokenizer,
     MeanScaleUniformBins,
+    ContextRouter,
+    MoEExpertHead,
+    LoadBalancingLoss,
 )
 from .chronos_bolt import ChronosBoltConfig, ChronosBoltPipeline
 
@@ -16,9 +21,14 @@ __all__ = [
     "ForecastType",
     "ChronosConfig",
     "ChronosModel",
+    "ChronosMoEModel",
     "ChronosPipeline",
+    "ChronosMoEPipeline",
     "ChronosTokenizer",
     "MeanScaleUniformBins",
+    "ContextRouter",
+    "MoEExpertHead",
+    "LoadBalancingLoss",
     "ChronosBoltConfig",
     "ChronosBoltPipeline",
 ]

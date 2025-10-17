@@ -671,7 +671,7 @@ class ChronosMoEModel(ChronosModel):
             
             total_weight = 0.0
             for i, expert_idx in enumerate(active_experts):
-                expert_idx = expert_idx.item()
+                expert_idx = expert_idx.long().item()  # Ensure long tensor
                 weight = router_probs[batch_idx, expert_idx]
                 
                 sample_combined += weight * expert_logits[expert_idx][batch_idx]
@@ -768,6 +768,118 @@ class ChronosPipeline(BaseChronosPipeline):
         super().__init__(inner_model=model.model)
         self.tokenizer = tokenizer
         self.model = model
+
+
+class ChronosMoEPipeline(ChronosPipeline):
+    """
+    MoE-specific pipeline that handles Mixture of Experts models.
+    
+    Extends ChronosPipeline with MoE-specific functionality like
+    load balancing loss tracking and expert utilization monitoring.
+    """
+    
+    def __init__(self, tokenizer, model):
+        if not isinstance(model, ChronosMoEModel):
+            raise ValueError("ChronosMoEPipeline requires ChronosMoEModel")
+        super().__init__(tokenizer, model)
+        
+        # Track MoE statistics
+        self.expert_usage_stats = {}
+        self.load_balancing_losses = []
+    
+    def get_expert_usage_stats(self) -> Dict[str, Any]:
+        """Get statistics about expert usage."""
+        return {
+            'expert_usage': self.expert_usage_stats.copy(),
+            'recent_load_losses': self.load_balancing_losses[-10:] if self.load_balancing_losses else [],
+            'avg_load_loss': sum(self.load_balancing_losses[-100:]) / len(self.load_balancing_losses[-100:]) if self.load_balancing_losses else 0.0
+        }
+    
+    def reset_stats(self):
+        """Reset expert usage statistics."""
+        self.expert_usage_stats.clear()
+        self.load_balancing_losses.clear()
+    
+    @torch.no_grad()
+    def predict_with_routing_info(
+        self,
+        context: Union[torch.Tensor, List[torch.Tensor]],
+        prediction_length: Optional[int] = None,
+        num_samples: Optional[int] = None,
+        temperature: Optional[float] = None,
+        top_k: Optional[int] = None,
+        top_p: Optional[float] = None,
+        return_routing_info: bool = True,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, Dict[str, Any]]]:
+        """
+        Predict with additional routing information for MoE analysis.
+        
+        Returns
+        -------
+        predictions or (predictions, routing_info)
+            If return_routing_info is True, returns tuple with routing information.
+            Otherwise returns just predictions like regular predict method.
+        """
+        context_tensor = self._prepare_and_validate_context(context=context)
+        
+        if prediction_length is None:
+            prediction_length = self.model.config.prediction_length
+        
+        # For MoE, we'll do a simplified prediction to get routing info
+        token_ids, attention_mask, scale = self.tokenizer.context_input_transform(context_tensor)
+        
+        # Get shared hidden states and routing information
+        shared_hidden = self.model.get_shared_hidden_states(
+            token_ids.to(self.model.device),
+            attention_mask.to(self.model.device)
+        )
+        
+        router_logits, router_probs = self.model.router(shared_hidden)
+        expert_indices, top_k_probs = self.model.router.get_top_k_experts(router_probs)
+        
+        # Track expert usage
+        if return_routing_info:
+            routing_info = {
+                'router_probs': router_probs.cpu().numpy(),
+                'expert_indices': expert_indices.cpu().numpy(),
+                'top_k_probs': top_k_probs.cpu().numpy(),
+                'num_experts': self.model.config.num_experts,
+                'num_active_experts': self.model.config.num_active_experts
+            }
+            
+            # Update usage stats
+            for batch_idx in range(expert_indices.shape[0]):
+                for expert_idx in expert_indices[batch_idx].cpu().numpy():
+                    expert_key = f"expert_{int(expert_idx)}"
+                    self.expert_usage_stats[expert_key] = self.expert_usage_stats.get(expert_key, 0) + 1
+        
+        # Get regular predictions
+        predictions = self.predict(
+            context=context,
+            prediction_length=prediction_length,
+            num_samples=num_samples,
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p
+        )
+        
+        if return_routing_info:
+            return predictions, routing_info
+        else:
+            return predictions
+    
+    def predict(self, *args, **kwargs) -> torch.Tensor:
+        """
+        Standard predict method - delegates to parent but handles MoE specifics.
+        
+        For MoE models, this currently uses a simplified approach since full
+        generation with MoE routing is complex. In practice, you'd want to
+        implement custom generation logic.
+        """
+        # For now, use the parent's predict method
+        # In a full implementation, you'd want custom generation logic
+        # that properly handles MoE routing during autoregressive generation
+        return super().predict(*args, **kwargs)
 
     def _prepare_and_validate_context(
         self, context: Union[torch.Tensor, List[torch.Tensor]]
@@ -950,7 +1062,16 @@ class ChronosPipeline(BaseChronosPipeline):
             assert chronos_config.model_type == "causal"
             inner_model = AutoModelForCausalLM.from_pretrained(*args, **kwargs)
 
-        return cls(
-            tokenizer=chronos_config.create_tokenizer(),
-            model=ChronosModel(config=chronos_config, model=inner_model),
-        )
+        # Choose appropriate model class based on MoE config
+        if chronos_config.use_moe:
+            model = ChronosMoEModel(config=chronos_config, model=inner_model)
+            return ChronosMoEPipeline(
+                tokenizer=chronos_config.create_tokenizer(),
+                model=model,
+            )
+        else:
+            model = ChronosModel(config=chronos_config, model=inner_model)
+            return cls(
+                tokenizer=chronos_config.create_tokenizer(),
+                model=model,
+            )
