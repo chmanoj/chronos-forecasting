@@ -9,6 +9,7 @@ from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from transformers import (
     AutoConfig,
     AutoModelForCausalLM,
@@ -45,6 +46,15 @@ class ChronosConfig:
     temperature: float
     top_k: int
     top_p: float
+    
+    # Mixture of Experts parameters
+    use_moe: bool = False
+    num_experts: int = 8
+    num_active_experts: int = 2
+    expert_capacity: Optional[int] = None
+    load_balancing_weight: float = 0.01
+    router_hidden_dim: int = 256
+    shared_layers: Optional[int] = None  # Number of shared layers before MoE
 
     def __post_init__(self):
         assert (
@@ -257,6 +267,175 @@ class MeanScaleUniformBins(ChronosTokenizer):
         return self.centers[indices] * scale_unsqueezed
 
 
+class ContextRouter(nn.Module):
+    """
+    Routes entire samples to experts based on context embeddings.
+    Uses sample-level routing instead of token-level routing.
+    """
+    
+    def __init__(self, input_dim: int, num_experts: int, num_active_experts: int, 
+                 router_hidden_dim: int = 256):
+        super().__init__()
+        self.num_experts = num_experts
+        self.num_active_experts = num_active_experts
+        
+        # Router network
+        self.gate = nn.Sequential(
+            nn.Linear(input_dim, router_hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(router_hidden_dim, num_experts)
+        )
+        
+        # Initialize router weights
+        for module in self.gate.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.normal_(module.weight, std=0.02)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+    
+    def forward(self, hidden_states: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Args:
+            hidden_states: (batch_size, seq_len, hidden_dim)
+        
+        Returns:
+            router_logits: (batch_size, num_experts)
+            router_probs: (batch_size, num_experts)
+        """
+        # Aggregate context for routing decision
+        # Use mean pooling across sequence length
+        context_repr = hidden_states.mean(dim=1)  # (batch_size, hidden_dim)
+        
+        # Get routing logits
+        router_logits = self.gate(context_repr)  # (batch_size, num_experts)
+        
+        # Convert to probabilities
+        router_probs = F.softmax(router_logits, dim=-1)
+        
+        return router_logits, router_probs
+    
+    def get_top_k_experts(self, router_probs: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Select top-k experts for each sample.
+        
+        Args:
+            router_probs: (batch_size, num_experts)
+            
+        Returns:
+            top_k_indices: (batch_size, num_active_experts)
+            top_k_probs: (batch_size, num_active_experts)
+        """
+        top_k_probs, top_k_indices = torch.topk(
+            router_probs, self.num_active_experts, dim=-1
+        )
+        
+        # Renormalize probabilities
+        top_k_probs = top_k_probs / top_k_probs.sum(dim=-1, keepdim=True)
+        
+        return top_k_indices, top_k_probs
+
+
+class MoEExpertHead(nn.Module):
+    """
+    Expert-specific head that processes shared hidden states.
+    This is a simplified expert that focuses on the final prediction layers.
+    """
+    
+    def __init__(self, config, base_model_config):
+        super().__init__()
+        self.config = config
+        
+        # Expert-specific layers
+        hidden_size = base_model_config.d_model
+        
+        # Add expert-specific feed-forward layers
+        self.expert_ffn = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size * 4),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(hidden_size * 4, hidden_size),
+            nn.Dropout(0.1)
+        )
+        
+        # Layer normalization
+        self.layer_norm = nn.LayerNorm(hidden_size)
+        
+        # Final prediction head
+        self.lm_head = nn.Linear(hidden_size, config.n_tokens, bias=False)
+        
+        # Initialize weights
+        self._init_weights()
+    
+    def _init_weights(self):
+        """Initialize expert weights."""
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.normal_(module.weight, std=0.02)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+    
+    def forward(self, hidden_states: torch.Tensor, attention_mask: torch.Tensor = None) -> torch.Tensor:
+        """
+        Args:
+            hidden_states: (batch_size, seq_len, hidden_dim)
+            attention_mask: (batch_size, seq_len)
+            
+        Returns:
+            logits: (batch_size, seq_len, vocab_size)
+        """
+        # Apply expert-specific transformation
+        expert_output = self.expert_ffn(hidden_states)
+        
+        # Residual connection and layer norm
+        hidden_states = self.layer_norm(hidden_states + expert_output)
+        
+        # Generate logits
+        logits = self.lm_head(hidden_states)
+        
+        return logits
+
+
+class LoadBalancingLoss(nn.Module):
+    """
+    Implements load balancing loss to ensure equal utilization of experts.
+    """
+    
+    def __init__(self, num_experts: int, num_active_experts: int):
+        super().__init__()
+        self.num_experts = num_experts
+        self.num_active_experts = num_active_experts
+    
+    def forward(self, router_probs: torch.Tensor, expert_indices: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            router_probs: (batch_size, num_experts)
+            expert_indices: (batch_size, num_active_experts)
+            
+        Returns:
+            load_balancing_loss: scalar tensor
+        """
+        batch_size = router_probs.size(0)
+        
+        # Calculate expert usage frequency
+        expert_usage = torch.zeros(self.num_experts, device=router_probs.device)
+        
+        for i in range(self.num_experts):
+            expert_usage[i] = (expert_indices == i).float().sum()
+        
+        # Normalize by total assignments
+        total_assignments = batch_size * self.num_active_experts
+        expert_usage = expert_usage / total_assignments
+        
+        # Calculate mean router probability for each expert
+        mean_router_probs = router_probs.mean(dim=0)
+        
+        # Load balancing loss: encourage uniform distribution
+        load_loss = (expert_usage * mean_router_probs).sum() * self.num_experts
+        
+        return load_loss
+
+
 class ChronosModel(nn.Module):
     """
     A ``ChronosModel`` wraps a ``PreTrainedModel`` object from ``transformers``
@@ -374,6 +553,195 @@ class ChronosModel(nn.Module):
             preds = preds[..., -prediction_length:]
 
         return preds.reshape(input_ids.size(0), num_samples, -1)
+
+
+class ChronosMoEModel(ChronosModel):
+    """
+    Mixture of Experts version of ChronosModel.
+    
+    Uses hybrid architecture:
+    - Shared early layers (encoder/embedding)
+    - Context-based routing 
+    - Expert-specific heads
+    - Logit-level mixing of expert outputs
+    """
+    
+    def __init__(self, config: ChronosConfig, model: PreTrainedModel) -> None:
+        super().__init__(config, model)
+        
+        if not config.use_moe:
+            raise ValueError("ChronosMoEModel requires use_moe=True in config")
+        
+        # Get model dimensions
+        if hasattr(model.config, 'd_model'):
+            hidden_size = model.config.d_model
+        elif hasattr(model.config, 'hidden_size'):
+            hidden_size = model.config.hidden_size
+        else:
+            raise ValueError("Could not determine model hidden size")
+        
+        # Context router for sample-level expert selection
+        self.router = ContextRouter(
+            input_dim=hidden_size,
+            num_experts=config.num_experts,
+            num_active_experts=config.num_active_experts,
+            router_hidden_dim=config.router_hidden_dim
+        )
+        
+        # Expert heads
+        self.experts = nn.ModuleList([
+            MoEExpertHead(config, model.config) 
+            for _ in range(config.num_experts)
+        ])
+        
+        # Load balancing loss
+        self.load_balancing_loss = LoadBalancingLoss(
+            num_experts=config.num_experts,
+            num_active_experts=config.num_active_experts
+        )
+        
+        # Determine shared layers boundary
+        self.shared_layers = config.shared_layers
+        if self.shared_layers is None:
+            # Default: use 2/3 of layers as shared
+            if hasattr(model.config, 'num_layers'):
+                total_layers = model.config.num_layers
+            elif hasattr(model.config, 'num_hidden_layers'):
+                total_layers = model.config.num_hidden_layers
+            else:
+                total_layers = 6  # Default fallback
+            self.shared_layers = max(1, int(total_layers * 2 / 3))
+    
+    def get_shared_hidden_states(self, input_ids: torch.Tensor, 
+                               attention_mask: torch.Tensor) -> torch.Tensor:
+        """
+        Extract shared hidden states from the base model.
+        
+        For seq2seq models (T5), this gets encoder hidden states.
+        For causal models (GPT), this gets intermediate hidden states.
+        """
+        if self.config.model_type == "seq2seq":
+            # For T5-like models, use encoder
+            if hasattr(self.model, 'encoder'):
+                outputs = self.model.encoder(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    return_dict=True
+                )
+                return outputs.last_hidden_state
+            else:
+                raise ValueError("seq2seq model missing encoder")
+        else:
+            # For causal models, we'd need to modify this
+            # For now, focus on seq2seq
+            raise NotImplementedError("Causal MoE not implemented yet")
+    
+    def combine_expert_logits(self, expert_logits: List[torch.Tensor], 
+                            router_probs: torch.Tensor,
+                            expert_indices: torch.Tensor) -> torch.Tensor:
+        """
+        Combine expert logits using router probabilities.
+        
+        Args:
+            expert_logits: List of tensors, each (batch_size, seq_len, vocab_size)
+            router_probs: (batch_size, num_experts)
+            expert_indices: (batch_size, num_active_experts)
+            
+        Returns:
+            combined_logits: (batch_size, seq_len, vocab_size)
+        """
+        batch_size, seq_len, vocab_size = expert_logits[0].shape
+        device = expert_logits[0].device
+        
+        # Initialize combined logits
+        combined_logits = torch.zeros(
+            batch_size, seq_len, vocab_size, 
+            device=device, dtype=expert_logits[0].dtype
+        )
+        
+        # For each sample, combine logits from its active experts
+        for batch_idx in range(batch_size):
+            sample_combined = torch.zeros(
+                seq_len, vocab_size,
+                device=device, dtype=expert_logits[0].dtype
+            )
+            
+            # Get active experts for this sample
+            active_experts = expert_indices[batch_idx]  # (num_active_experts,)
+            
+            total_weight = 0.0
+            for i, expert_idx in enumerate(active_experts):
+                expert_idx = expert_idx.item()
+                weight = router_probs[batch_idx, expert_idx]
+                
+                sample_combined += weight * expert_logits[expert_idx][batch_idx]
+                total_weight += weight
+            
+            # Normalize (should be close to 1.0 already)
+            if total_weight > 0:
+                sample_combined = sample_combined / total_weight
+            
+            combined_logits[batch_idx] = sample_combined
+        
+        return combined_logits
+    
+    def forward(self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        prediction_length: Optional[int] = None,
+        num_samples: Optional[int] = None,
+        temperature: Optional[float] = None,
+        top_k: Optional[int] = None,
+        top_p: Optional[float] = None,
+        labels: Optional[torch.Tensor] = None,
+        return_moe_loss: bool = False,
+    ) -> torch.Tensor:
+        """
+        Forward pass with MoE routing.
+        
+        Args:
+            input_ids: (batch_size, seq_len)
+            attention_mask: (batch_size, seq_len)
+            labels: (batch_size, seq_len) - for training
+            return_moe_loss: Whether to return MoE auxiliary losses
+            
+        Returns:
+            If return_moe_loss:
+                (logits, load_balancing_loss)
+            Else:
+                logits or generated samples
+        """
+        # Extract shared hidden states
+        shared_hidden = self.get_shared_hidden_states(input_ids, attention_mask)
+        
+        # Route samples to experts
+        router_logits, router_probs = self.router(shared_hidden)
+        expert_indices, top_k_probs = self.router.get_top_k_experts(router_probs)
+        
+        # Get outputs from all experts
+        expert_logits = []
+        for expert in self.experts:
+            logits = expert(shared_hidden, attention_mask)
+            expert_logits.append(logits)
+        
+        # Combine expert outputs using router probabilities
+        combined_logits = self.combine_expert_logits(
+            expert_logits, router_probs, expert_indices
+        )
+        
+        if return_moe_loss:
+            # Calculate load balancing loss
+            load_loss = self.load_balancing_loss(router_probs, expert_indices)
+            return combined_logits, load_loss
+        
+        # If we have labels, return logits for training
+        if labels is not None:
+            return combined_logits
+        
+        # Otherwise, use the combined logits for generation
+        # For generation, we need to use the base model's generate method
+        # but with our custom logits. This is complex, so for now return logits.
+        return combined_logits
 
 
 class ChronosPipeline(BaseChronosPipeline):
