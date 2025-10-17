@@ -18,6 +18,7 @@ import typer
 from typer_config import use_yaml_config
 import numpy as np
 import torch
+import torch.nn
 import torch.distributed as dist
 from torch.utils.data import IterableDataset, get_worker_info
 import transformers
@@ -44,7 +45,7 @@ from gluonts.transform import (
     LastValueImputation,
 )
 
-from chronos import ChronosConfig, ChronosTokenizer
+from chronos import ChronosConfig, ChronosTokenizer, ChronosModel, ChronosMoEModel
 
 
 app = typer.Typer(pretty_exceptions_enable=False)
@@ -160,6 +161,7 @@ def load_model(
     tie_embeddings=False,
     pad_token_id=0,
     eos_token_id=1,
+    chronos_config=None,
 ):
     """
     Load the specified HuggingFace model, adjusting the vocabulary
@@ -189,6 +191,7 @@ def load_model(
     model.config.pad_token_id = model.generation_config.pad_token_id = pad_token_id
     model.config.eos_token_id = model.generation_config.eos_token_id = eos_token_id
 
+    # Don't wrap the model here - we'll handle MOE in the trainer
     return model
 
 
@@ -538,6 +541,12 @@ def main(
     top_k: int = 50,
     top_p: float = 1.0,
     seed: Optional[int] = None,
+    # MOE parameters
+    use_moe: bool = False,
+    num_experts: int = 8,
+    num_active_experts: int = 2,
+    load_balancing_weight: float = 0.01,
+    router_hidden_dim: int = 256,
 ):
     if tf32 and not (
         torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 8
@@ -613,15 +622,11 @@ def main(
 
     log_on_main("Initializing model", logger)
 
-    model = load_model(
-        model_id=model_id,
-        model_type=model_type,
-        vocab_size=n_tokens,
-        random_init=random_init,
-        tie_embeddings=tie_embeddings,
-        pad_token_id=pad_token_id,
-        eos_token_id=eos_token_id,
-    )
+    def count_parameters(model):
+        """Count the total number of parameters in a model."""
+        total_params = sum(p.numel() for p in model.parameters())
+        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        return total_params, trainable_params
 
     chronos_config = ChronosConfig(
         tokenizer_class=tokenizer_class,
@@ -638,10 +643,31 @@ def main(
         temperature=temperature,
         top_k=top_k,
         top_p=top_p,
+        # MOE parameters
+        use_moe=use_moe,
+        num_experts=num_experts,
+        num_active_experts=num_active_experts,
+        load_balancing_weight=load_balancing_weight,
+        router_hidden_dim=router_hidden_dim,
+    )
+
+    model = load_model(
+        model_id=model_id,
+        model_type=model_type,
+        vocab_size=n_tokens,
+        random_init=random_init,
+        tie_embeddings=tie_embeddings,
+        pad_token_id=pad_token_id,
+        eos_token_id=eos_token_id,
+        chronos_config=chronos_config,
     )
 
     # Add extra items to model config so that it's saved in the ckpt
     model.config.chronos_config = chronos_config.__dict__
+
+    # Count and log base model parameters
+    total_params, trainable_params = count_parameters(model)
+    log_on_main(f"Base model parameters: {total_params:,} total, {trainable_params:,} trainable", logger)
 
     shuffled_train_dataset = ChronosDataset(
         datasets=train_datasets,
@@ -676,16 +702,87 @@ def main(
         torch_compile=torch_compile,
         ddp_find_unused_parameters=False,
         remove_unused_columns=False,
+        # Device will be auto-detected (MPS, CUDA, or CPU)
     )
 
-    # Create Trainer instance
-    trainer = Trainer(
-        model=model,
-        args=training_args,
-        train_dataset=shuffled_train_dataset,
-    )
+    # Create trainer - use custom trainer for MOE models
+    if use_moe:
+        class MoETrainer(Trainer):
+            def __init__(self, *args, **kwargs):
+                self.chronos_config = chronos_config
+                self.moe_model = None  # Will be created lazily
+                super().__init__(*args, **kwargs)
+            
+            def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+                labels = inputs.pop("labels")
+                
+                # Ensure MOE model is created
+                if self.moe_model is None:
+                    device = next(model.parameters()).device
+                    self.moe_model = ChronosMoEModel(config=self.chronos_config, model=model)
+                    
+                    # Count MOE model parameters
+                    def count_parameters(model):
+                        total_params = sum(p.numel() for p in model.parameters())
+                        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+                        return total_params, trainable_params
+                    
+                    total_params, trainable_params = count_parameters(self.moe_model)
+                    base_total, base_trainable = count_parameters(model)
+                    moe_overhead = total_params - base_total
+                    
+                    log_on_main(f"MOE model created on device: {device}", logger)
+                    log_on_main(f"MOE model parameters: {total_params:,} total, {trainable_params:,} trainable", logger)
+                    log_on_main(f"MOE overhead: {moe_overhead:,} parameters ({moe_overhead/base_total*100:.1f}% increase)", logger)
+                
+                # Use MOE model for forward pass
+                logits, load_loss = self.moe_model(
+                    input_ids=inputs["input_ids"],
+                    attention_mask=inputs["attention_mask"],
+                    return_moe_loss=True
+                )
+                
+                # Compute standard cross-entropy loss
+                loss_fct = torch.nn.CrossEntropyLoss(ignore_index=-100)
+                
+                # Handle sequence length mismatch for seq2seq models
+                if logits.size(1) != labels.size(1):
+                    min_len = min(logits.size(1), labels.size(1))
+                    logits = logits[:, :min_len, :]
+                    labels = labels[:, :min_len]
+                
+                ce_loss = loss_fct(
+                    logits.reshape(-1, logits.size(-1)),
+                    labels.reshape(-1)
+                )
+                
+                # Add load balancing loss
+                total_loss = ce_loss + load_balancing_weight * load_loss
+                
+                # Log losses for monitoring
+                if hasattr(self, 'log') and self.state.global_step % 10 == 0:
+                    self.log({
+                        "train_ce_loss": ce_loss.item(),
+                        "train_load_loss": load_loss.item(),
+                        "train_total_loss": total_loss.item(),
+                    })
+                
+                return (total_loss, logits) if return_outputs else total_loss
+        
+        trainer = MoETrainer(
+            model=model,  # Pass the base model to trainer
+            args=training_args,
+            train_dataset=shuffled_train_dataset,
+        )
+        log_on_main(f"Created MoE trainer with {chronos_config.num_experts} experts", logger)
+    else:
+        trainer = Trainer(
+            model=model,
+            args=training_args,
+            train_dataset=shuffled_train_dataset,
+        )
+    
     log_on_main("Training", logger)
-
     trainer.train()
 
     if is_main_process():

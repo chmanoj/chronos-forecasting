@@ -572,7 +572,7 @@ class ChronosMoEModel(ChronosModel):
         if not config.use_moe:
             raise ValueError("ChronosMoEModel requires use_moe=True in config")
         
-        # Get model dimensions
+        # Get model dimensions and device
         if hasattr(model.config, 'd_model'):
             hidden_size = model.config.d_model
         elif hasattr(model.config, 'hidden_size'):
@@ -580,17 +580,20 @@ class ChronosMoEModel(ChronosModel):
         else:
             raise ValueError("Could not determine model hidden size")
         
+        # Get the device of the base model
+        device = next(model.parameters()).device
+        
         # Context router for sample-level expert selection
         self.router = ContextRouter(
             input_dim=hidden_size,
             num_experts=config.num_experts,
             num_active_experts=config.num_active_experts,
             router_hidden_dim=config.router_hidden_dim
-        )
+        ).to(device)
         
         # Expert heads
         self.experts = nn.ModuleList([
-            MoEExpertHead(config, model.config) 
+            MoEExpertHead(config, model.config).to(device)
             for _ in range(config.num_experts)
         ])
         
@@ -598,7 +601,7 @@ class ChronosMoEModel(ChronosModel):
         self.load_balancing_loss = LoadBalancingLoss(
             num_experts=config.num_experts,
             num_active_experts=config.num_active_experts
-        )
+        ).to(device)
         
         # Determine shared layers boundary
         self.shared_layers = config.shared_layers
