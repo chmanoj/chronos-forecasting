@@ -81,9 +81,9 @@ class SimpleMoEDataset:
         labels[labels_mask == 0] = -100
         
         return {
-            'input_ids': input_ids.squeeze(0),
-            'attention_mask': attention_mask.squeeze(0),
-            'labels': labels.squeeze(0),
+            'input_ids': input_ids.squeeze(0).long(),  # Ensure long tensor for indices
+            'attention_mask': attention_mask.squeeze(0).bool(),  # Ensure bool tensor for mask
+            'labels': labels.squeeze(0).long(),  # Ensure long tensor for labels
             'pattern_type': pattern_type
         }
 
@@ -230,75 +230,88 @@ def test_moe_components():
 
 
 def test_moe_model_creation():
-    """Test MoE model creation and basic forward pass."""
+    """Test MoE model creation and basic forward pass for both architectures."""
     print("Testing MoE model creation...")
     
-    # Create MoE config
-    chronos_config = ChronosConfig(
-        tokenizer_class="MeanScaleUniformBins",
-        tokenizer_kwargs={'low_limit': -10.0, 'high_limit': 10.0},
-        n_tokens=1024,
-        n_special_tokens=2,
-        pad_token_id=0,
-        eos_token_id=1,
-        use_eos_token=True,
-        model_type="seq2seq",
-        context_length=64,
-        prediction_length=24,
-        num_samples=10,
-        temperature=1.0,
-        top_k=50,
-        top_p=1.0,
-        # MoE specific
-        use_moe=True,
-        num_experts=4,  # Small number for testing
-        num_active_experts=2,
-        load_balancing_weight=0.01,
-        router_hidden_dim=128,
-    )
+    # Test both architectures
+    architectures = ["shared_then_expert", "expert_only"]
     
-    # Load base model
-    base_model = simple_load_model(vocab_size=chronos_config.n_tokens)
+    for arch in architectures:
+        print(f"\n--- Testing {arch} architecture ---")
+        
+        # Create MoE config
+        chronos_config = ChronosConfig(
+            tokenizer_class="MeanScaleUniformBins",
+            tokenizer_kwargs={'low_limit': -10.0, 'high_limit': 10.0},
+            n_tokens=1024,
+            n_special_tokens=2,
+            pad_token_id=0,
+            eos_token_id=1,
+            use_eos_token=True,
+            model_type="seq2seq",
+            context_length=64,
+            prediction_length=24,
+            num_samples=10,
+            temperature=1.0,
+            top_k=50,
+            top_p=1.0,
+            # MoE specific
+            use_moe=True,
+            num_experts=4,  # Small number for testing
+            num_active_experts=2,
+            load_balancing_weight=0.01,
+            router_hidden_dim=128,
+            moe_architecture=arch,
+        )
+        
+        # Load base model
+        base_model = simple_load_model(vocab_size=chronos_config.n_tokens)
+        
+        # Create MoE model
+        moe_model = ChronosMoEModel(config=chronos_config, model=base_model)
+        
+        print(f"Created {arch} MoE model with {chronos_config.num_experts} experts")
+        print(f"Active experts per sample: {chronos_config.num_active_experts}")
+        
+        # Test forward pass
+        batch_size = 2
+        seq_len = chronos_config.context_length
+        
+        input_ids = torch.randint(0, chronos_config.n_tokens, (batch_size, seq_len))
+        attention_mask = torch.ones(batch_size, seq_len, dtype=torch.bool)
+        
+        # Test getting shared hidden states
+        shared_hidden = moe_model.get_shared_hidden_states(input_ids, attention_mask)
+        print(f"Shared hidden states shape: {shared_hidden.shape}")
+        
+        # Test routing
+        router_logits, router_probs = moe_model.router(shared_hidden)
+        expert_indices, top_k_probs = moe_model.router.get_top_k_experts(router_probs)
+        
+        print(f"Router probs shape: {router_probs.shape}")
+        print(f"Expert indices shape: {expert_indices.shape}")
+        print(f"Sample expert assignments: {expert_indices.numpy()}")
+        
+        # Test forward pass with MoE
+        logits, load_loss = moe_model.forward(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            return_moe_loss=True
+        )
+        
+        print(f"Output logits shape: {logits.shape}")
+        print(f"Load balancing loss: {load_loss.item():.6f}")
+        
+        assert logits.shape == (batch_size, seq_len, chronos_config.n_tokens)
+        assert load_loss.item() >= 0
+        
+        # Count parameters for comparison
+        total_params = sum(p.numel() for p in moe_model.parameters())
+        print(f"Total parameters: {total_params:,}")
+        
+        print(f"✅ {arch} architecture test passed!")
     
-    # Create MoE model
-    moe_model = ChronosMoEModel(config=chronos_config, model=base_model)
-    
-    print(f"Created MoE model with {chronos_config.num_experts} experts")
-    print(f"Active experts per sample: {chronos_config.num_active_experts}")
-    
-    # Test forward pass
-    batch_size = 2
-    seq_len = chronos_config.context_length
-    
-    input_ids = torch.randint(0, chronos_config.n_tokens, (batch_size, seq_len))
-    attention_mask = torch.ones(batch_size, seq_len, dtype=torch.bool)
-    
-    # Test getting shared hidden states
-    shared_hidden = moe_model.get_shared_hidden_states(input_ids, attention_mask)
-    print(f"Shared hidden states shape: {shared_hidden.shape}")
-    
-    # Test routing
-    router_logits, router_probs = moe_model.router(shared_hidden)
-    expert_indices, top_k_probs = moe_model.router.get_top_k_experts(router_probs)
-    
-    print(f"Router probs shape: {router_probs.shape}")
-    print(f"Expert indices shape: {expert_indices.shape}")
-    print(f"Sample expert assignments: {expert_indices.numpy()}")
-    
-    # Test forward pass with MoE
-    logits, load_loss = moe_model.forward(
-        input_ids=input_ids,
-        attention_mask=attention_mask,
-        return_moe_loss=True
-    )
-    
-    print(f"Output logits shape: {logits.shape}")
-    print(f"Load balancing loss: {load_loss.item():.6f}")
-    
-    assert logits.shape == (batch_size, seq_len, chronos_config.n_tokens)
-    assert load_loss.item() >= 0
-    
-    print("✅ MoE model creation and forward pass test passed!")
+    print("✅ All MoE model creation and forward pass tests passed!")
 
 
 def test_moe_pipeline():
@@ -405,7 +418,14 @@ def test_moe_training():
         # Create MoE model
         moe_model = ChronosMoEModel(config=chronos_config, model=base_model)
         
+        # Force CPU for training test to avoid MPS issues
+        if torch.backends.mps.is_available():
+            print("Detected MPS device, forcing CPU for training test to avoid allocation issues")
+            moe_model = moe_model.cpu()
+            base_model = base_model.cpu()
+        
         print(f"Created MoE model with {chronos_config.num_experts} experts")
+        print(f"Model device: {next(moe_model.parameters()).device}")
         
         # Create dataset
         dataset = SimpleMoEDataset(
@@ -488,11 +508,14 @@ def test_moe_training():
             moe_model.eval()
             expert_usage = {f"expert_{i}": 0 for i in range(chronos_config.num_experts)}
             
+            # Get model device
+            model_device = next(moe_model.parameters()).device
+            
             with torch.no_grad():
                 for i in range(min(10, len(dataset))):
                     sample = dataset[i]
-                    input_ids = sample["input_ids"].unsqueeze(0)
-                    attention_mask = sample["attention_mask"].unsqueeze(0)
+                    input_ids = sample["input_ids"].unsqueeze(0).to(model_device)
+                    attention_mask = sample["attention_mask"].unsqueeze(0).to(model_device)
                     
                     shared_hidden = moe_model.get_shared_hidden_states(input_ids, attention_mask)
                     _, router_probs = moe_model.router(shared_hidden)
@@ -517,6 +540,75 @@ def test_moe_training():
         if os.path.exists(data_path):
             shutil.rmtree(data_path)
             print(f"Cleaned up test data: {data_path}")
+
+
+def test_moe_architecture_comparison():
+    """Compare shared_then_expert vs expert_only architectures."""
+    print("Comparing MoE architectures...")
+    
+    architectures = ["shared_then_expert", "expert_only"]
+    models = {}
+    
+    for arch in architectures:
+        print(f"\n--- Creating {arch} model ---")
+        
+        config = ChronosConfig(
+            tokenizer_class="MeanScaleUniformBins",
+            tokenizer_kwargs={'low_limit': -10.0, 'high_limit': 10.0},
+            n_tokens=1024,
+            n_special_tokens=2,
+            pad_token_id=0,
+            eos_token_id=1,
+            use_eos_token=True,
+            model_type="seq2seq",
+            context_length=64,
+            prediction_length=24,
+            num_samples=10,
+            temperature=1.0,
+            top_k=50,
+            top_p=1.0,
+            use_moe=True,
+            num_experts=4,
+            num_active_experts=2,
+            moe_architecture=arch,
+        )
+        
+        base_model = simple_load_model(vocab_size=1024)
+        moe_model = ChronosMoEModel(config=config, model=base_model)
+        
+        # Count parameters
+        total_params = sum(p.numel() for p in moe_model.parameters())
+        print(f"{arch} parameters: {total_params:,}")
+        
+        models[arch] = (moe_model, total_params)
+    
+    # Compare parameter counts
+    shared_params = models["shared_then_expert"][1]
+    expert_params = models["expert_only"][1]
+    print(f"\nParameter comparison:")
+    print(f"shared_then_expert: {shared_params:,}")
+    print(f"expert_only: {expert_params:,}")
+    print(f"Ratio (expert_only/shared_then_expert): {expert_params/shared_params:.2f}")
+    
+    # Test forward pass timing
+    batch_size = 4
+    seq_len = 64
+    input_ids = torch.randint(0, 1024, (batch_size, seq_len))
+    attention_mask = torch.ones(batch_size, seq_len, dtype=torch.bool)
+    
+    import time
+    for arch, (model, _) in models.items():
+        start_time = time.time()
+        with torch.no_grad():
+            output, load_loss = model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                return_moe_loss=True
+            )
+        elapsed = time.time() - start_time
+        print(f"{arch} forward time: {elapsed:.4f}s")
+    
+    print("✅ Architecture comparison completed!")
 
 
 def test_moe_vs_regular_comparison():
@@ -545,7 +637,7 @@ def test_moe_vs_regular_comparison():
             use_moe=False,  # Regular model
         )
         
-        # MoE config
+        # MoE config (shared_then_expert)
         moe_config = ChronosConfig(
             tokenizer_class="MeanScaleUniformBins",
             tokenizer_kwargs={'low_limit': -10.0, 'high_limit': 10.0},
@@ -564,6 +656,7 @@ def test_moe_vs_regular_comparison():
             use_moe=True,  # MoE model
             num_experts=4,
             num_active_experts=2,
+            moe_architecture="shared_then_expert",
         )
         
         # Create models
@@ -665,13 +758,23 @@ if __name__ == "__main__":
     
     print("\n" + "=" * 60)
     
-    # Test 5: Comparison
+    # Test 5: Architecture Comparison
+    try:
+        test_moe_architecture_comparison()
+    except Exception as e:
+        print(f"❌ MoE architecture comparison test failed: {e}")
+        import traceback
+        traceback.print_exc()
+    
+    print("\n" + "=" * 60)
+    
+    # Test 6: MoE vs Regular Comparison
     try:
         test_moe_vs_regular_comparison()
     except Exception as e:
-        print(f"❌ MoE comparison test failed: {e}")
+        print(f"❌ MoE vs regular comparison test failed: {e}")
         import traceback
         traceback.print_exc()
     
     print("\n🎉 MoE testing completed!")
-    print("Your Chronos MoE implementation is ready!")
+    print("Your Chronos MoE implementation with dual architectures is ready!")

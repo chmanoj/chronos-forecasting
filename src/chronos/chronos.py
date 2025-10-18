@@ -54,7 +54,10 @@ class ChronosConfig:
     expert_capacity: Optional[int] = None
     load_balancing_weight: float = 0.01
     router_hidden_dim: int = 256
-    shared_layers: Optional[int] = None  # Number of shared layers before MoE
+    
+    # MOE Architecture Control
+    moe_architecture: Literal["shared_then_expert", "expert_only"] = "shared_then_expert"
+    shared_layers: Optional[int] = None  # Number of shared layers before MoE (for shared_then_expert mode)
 
     def __post_init__(self):
         assert (
@@ -340,6 +343,7 @@ class MoEExpertHead(nn.Module):
     """
     Expert-specific head that processes shared hidden states.
     This is a simplified expert that focuses on the final prediction layers.
+    Used in 'shared_then_expert' mode.
     """
     
     def __init__(self, config, base_model_config):
@@ -389,6 +393,90 @@ class MoEExpertHead(nn.Module):
         
         # Residual connection and layer norm
         hidden_states = self.layer_norm(hidden_states + expert_output)
+        
+        # Generate logits
+        logits = self.lm_head(hidden_states)
+        
+        return logits
+
+
+class MoEExpertEncoder(nn.Module):
+    """
+    Expert-specific encoder that includes full transformer layers.
+    Used in 'expert_only' mode where each expert has its own encoder stack.
+    """
+    
+    def __init__(self, config, base_model_config):
+        super().__init__()
+        self.config = config
+        self.base_model_config = base_model_config
+        
+        # Create expert-specific encoder layers
+        self.encoder_layers = self._create_encoder_layers()
+        
+        # Final prediction head
+        self.lm_head = nn.Linear(base_model_config.d_model, config.n_tokens, bias=False)
+        
+        # Initialize weights
+        self._init_weights()
+    
+    def _create_encoder_layers(self):
+        """Create encoder layers based on the base model architecture."""
+        # This is a simplified approach - in practice you'd want to copy
+        # the exact architecture from the base model
+        hidden_size = self.base_model_config.d_model
+        num_layers = getattr(self.base_model_config, 'num_layers', 
+                           getattr(self.base_model_config, 'num_hidden_layers', 6))
+        
+        layers = nn.ModuleList()
+        for _ in range(num_layers):
+            layer = nn.TransformerEncoderLayer(
+                d_model=hidden_size,
+                nhead=getattr(self.base_model_config, 'num_attention_heads', 8),
+                dim_feedforward=hidden_size * 4,
+                dropout=0.1,
+                activation='relu',
+                batch_first=True
+            )
+            layers.append(layer)
+        
+        return layers
+    
+    def _init_weights(self):
+        """Initialize expert weights."""
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.normal_(module.weight, std=0.02)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+            elif isinstance(module, nn.MultiheadAttention):
+                nn.init.normal_(module.in_proj_weight, std=0.02)
+                nn.init.normal_(module.out_proj.weight, std=0.02)
+    
+    def forward(self, hidden_states: torch.Tensor, attention_mask: torch.Tensor = None) -> torch.Tensor:
+        """
+        Args:
+            hidden_states: (batch_size, seq_len, hidden_dim) - embeddings from shared layer
+            attention_mask: (batch_size, seq_len)
+            
+        Returns:
+            logits: (batch_size, seq_len, vocab_size)
+        """
+        # Ensure tensors are on the same device
+        device = hidden_states.device
+        
+        # Convert attention mask to the format expected by TransformerEncoderLayer
+        if attention_mask is not None:
+            attention_mask = attention_mask.to(device)
+            # Convert boolean mask to float mask for transformer layers
+            # True -> 0.0 (attend), False -> -inf (don't attend)
+            attention_mask = attention_mask.float()
+            attention_mask = attention_mask.masked_fill(attention_mask == 0, float('-inf'))
+            attention_mask = attention_mask.masked_fill(attention_mask == 1, 0.0)
+        
+        # Pass through encoder layers
+        for layer in self.encoder_layers:
+            hidden_states = layer(hidden_states, src_key_padding_mask=attention_mask)
         
         # Generate logits
         logits = self.lm_head(hidden_states)
@@ -559,11 +647,11 @@ class ChronosMoEModel(ChronosModel):
     """
     Mixture of Experts version of ChronosModel.
     
-    Uses hybrid architecture:
-    - Shared early layers (encoder/embedding)
-    - Context-based routing 
-    - Expert-specific heads
-    - Logit-level mixing of expert outputs
+    Supports two architectures:
+    1. 'shared_then_expert': Shared encoder + expert prediction heads
+    2. 'expert_only': Shared embedding + expert encoders + expert heads
+    
+    Uses context-based routing for sample-level expert selection.
     """
     
     def __init__(self, config: ChronosConfig, model: PreTrainedModel) -> None:
@@ -583,6 +671,9 @@ class ChronosMoEModel(ChronosModel):
         # Get the device of the base model
         device = next(model.parameters()).device
         
+        # Store architecture mode
+        self.moe_architecture = config.moe_architecture
+        
         # Context router for sample-level expert selection
         self.router = ContextRouter(
             input_dim=hidden_size,
@@ -591,53 +682,89 @@ class ChronosMoEModel(ChronosModel):
             router_hidden_dim=config.router_hidden_dim
         ).to(device)
         
-        # Expert heads
-        self.experts = nn.ModuleList([
-            MoEExpertHead(config, model.config).to(device)
-            for _ in range(config.num_experts)
-        ])
+        # Create experts based on architecture mode
+        if config.moe_architecture == "shared_then_expert":
+            # Current approach: shared encoder + expert heads
+            self.experts = nn.ModuleList([
+                MoEExpertHead(config, model.config).to(device)
+                for _ in range(config.num_experts)
+            ])
+            
+            # Determine shared layers boundary
+            self.shared_layers = config.shared_layers
+            if self.shared_layers is None:
+                # Default: use 2/3 of layers as shared
+                if hasattr(model.config, 'num_layers'):
+                    total_layers = model.config.num_layers
+                elif hasattr(model.config, 'num_hidden_layers'):
+                    total_layers = model.config.num_hidden_layers
+                else:
+                    total_layers = 6  # Default fallback
+                self.shared_layers = max(1, int(total_layers * 2 / 3))
+        
+        elif config.moe_architecture == "expert_only":
+            # New approach: expert encoders + expert heads
+            self.experts = nn.ModuleList([
+                MoEExpertEncoder(config, model.config).to(device)
+                for _ in range(config.num_experts)
+            ])
+            
+            # Store shared embedding layer
+            if hasattr(model, 'shared') and hasattr(model.shared, 'embed_tokens'):
+                # T5-style models
+                self.shared_embedding = model.shared.embed_tokens
+            elif hasattr(model, 'encoder') and hasattr(model.encoder, 'embed_tokens'):
+                # Other seq2seq models
+                self.shared_embedding = model.encoder.embed_tokens
+            else:
+                raise ValueError("Could not find embedding layer in base model")
+        
+        else:
+            raise ValueError(f"Unknown moe_architecture: {config.moe_architecture}")
         
         # Load balancing loss
         self.load_balancing_loss = LoadBalancingLoss(
             num_experts=config.num_experts,
             num_active_experts=config.num_active_experts
         ).to(device)
-        
-        # Determine shared layers boundary
-        self.shared_layers = config.shared_layers
-        if self.shared_layers is None:
-            # Default: use 2/3 of layers as shared
-            if hasattr(model.config, 'num_layers'):
-                total_layers = model.config.num_layers
-            elif hasattr(model.config, 'num_hidden_layers'):
-                total_layers = model.config.num_hidden_layers
-            else:
-                total_layers = 6  # Default fallback
-            self.shared_layers = max(1, int(total_layers * 2 / 3))
     
     def get_shared_hidden_states(self, input_ids: torch.Tensor, 
                                attention_mask: torch.Tensor) -> torch.Tensor:
         """
         Extract shared hidden states from the base model.
         
-        For seq2seq models (T5), this gets encoder hidden states.
-        For causal models (GPT), this gets intermediate hidden states.
+        Behavior depends on moe_architecture:
+        - 'shared_then_expert': Gets encoder hidden states from shared encoder
+        - 'expert_only': Gets embedding states from shared embedding layer
         """
-        if self.config.model_type == "seq2seq":
-            # For T5-like models, use encoder
-            if hasattr(self.model, 'encoder'):
-                outputs = self.model.encoder(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    return_dict=True
-                )
-                return outputs.last_hidden_state
+        # Ensure inputs are on the correct device
+        device = self.device
+        input_ids = input_ids.to(device)
+        attention_mask = attention_mask.to(device)
+        
+        if self.moe_architecture == "shared_then_expert":
+            # Use shared encoder (current behavior)
+            if self.config.model_type == "seq2seq":
+                if hasattr(self.model, 'encoder'):
+                    outputs = self.model.encoder(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        return_dict=True
+                    )
+                    return outputs.last_hidden_state
+                else:
+                    raise ValueError("seq2seq model missing encoder")
             else:
-                raise ValueError("seq2seq model missing encoder")
+                # For causal models, we'd need to modify this
+                raise NotImplementedError("Causal MoE not implemented yet")
+        
+        elif self.moe_architecture == "expert_only":
+            # Use only shared embedding layer
+            embeddings = self.shared_embedding(input_ids)
+            return embeddings
+        
         else:
-            # For causal models, we'd need to modify this
-            # For now, focus on seq2seq
-            raise NotImplementedError("Causal MoE not implemented yet")
+            raise ValueError(f"Unknown moe_architecture: {self.moe_architecture}")
     
     def combine_expert_logits(self, expert_logits: List[torch.Tensor], 
                             router_probs: torch.Tensor,
@@ -655,6 +782,10 @@ class ChronosMoEModel(ChronosModel):
         """
         batch_size, seq_len, vocab_size = expert_logits[0].shape
         device = expert_logits[0].device
+        
+        # Ensure all tensors are on the same device
+        router_probs = router_probs.to(device)
+        expert_indices = expert_indices.to(device)
         
         # Initialize combined logits
         combined_logits = torch.zeros(
@@ -714,18 +845,43 @@ class ChronosMoEModel(ChronosModel):
             Else:
                 logits or generated samples
         """
-        # Extract shared hidden states
-        shared_hidden = self.get_shared_hidden_states(input_ids, attention_mask)
+        # Ensure inputs are on correct device
+        device = self.device
+        input_ids = input_ids.to(device)
+        attention_mask = attention_mask.to(device)
+        if labels is not None:
+            labels = labels.to(device)
         
-        # Route samples to experts
-        router_logits, router_probs = self.router(shared_hidden)
-        expert_indices, top_k_probs = self.router.get_top_k_experts(router_probs)
+        if self.moe_architecture == "shared_then_expert":
+            # Current approach: shared processing then expert routing
+            shared_hidden = self.get_shared_hidden_states(input_ids, attention_mask)
+            
+            # Route samples to experts based on shared hidden states
+            router_logits, router_probs = self.router(shared_hidden)
+            expert_indices, top_k_probs = self.router.get_top_k_experts(router_probs)
+            
+            # Get outputs from all experts
+            expert_logits = []
+            for expert in self.experts:
+                logits = expert(shared_hidden, attention_mask.to(device))
+                expert_logits.append(logits)
         
-        # Get outputs from all experts
-        expert_logits = []
-        for expert in self.experts:
-            logits = expert(shared_hidden, attention_mask)
-            expert_logits.append(logits)
+        elif self.moe_architecture == "expert_only":
+            # New approach: early routing after embedding
+            shared_embeddings = self.get_shared_hidden_states(input_ids, attention_mask)
+            
+            # Route samples to experts based on embeddings
+            router_logits, router_probs = self.router(shared_embeddings)
+            expert_indices, top_k_probs = self.router.get_top_k_experts(router_probs)
+            
+            # Get outputs from all experts (each processes from embeddings)
+            expert_logits = []
+            for expert in self.experts:
+                logits = expert(shared_embeddings, attention_mask.to(device))
+                expert_logits.append(logits)
+        
+        else:
+            raise ValueError(f"Unknown moe_architecture: {self.moe_architecture}")
         
         # Combine expert outputs using router probabilities
         combined_logits = self.combine_expert_logits(
